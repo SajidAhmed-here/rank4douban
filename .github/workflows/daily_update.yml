@@ -71,31 +71,62 @@ jobs:
               assert driver.title == 'Browser check', 'Browser startup check failed'
           PY
 
-      - name: Refresh ranking CSVs
-        run: python update_snippets.py
-
-      - name: Validate refreshed CSVs
-        # Some scrapers silently write an empty list when a site blocks requests.
-        # Fail before publishing such results, including the currently empty Letterboxd list.
+      - name: Refresh rankings independently and preserve unavailable sources
+        # Each updater runs unchanged in its own process. A blocked source must
+        # not discard successful updates or replace its previous CSV with an empty file.
         run: |
           python - <<'PY'
           import csv
+          import os
+          import subprocess
+          import sys
           from pathlib import Path
 
-          filenames = (
-              '01_IMDbtop250.csv', '03_CClist.csv', '06_Bangumitop250.csv',
-              '08_letterboxed_top_250.csv', '99_douban_top250.csv',
+          sources = (
+              ('Douban', 'update_douban', '99_douban_top250.csv'),
+              ('IMDb', 'update_imdb_top_250', '01_IMDbtop250.csv'),
+              ('Bangumi', 'update_bgm_top_250', '06_Bangumitop250.csv'),
+              ('Criterion', 'update_cclist', '03_CClist.csv'),
+              ('Letterboxd', 'update_letterboxed_top_250', '08_letterboxed_top_250.csv'),
           )
-          for filename in filenames:
+          results = []
+          successful = 0
+          for name, function, filename in sources:
               path = Path('data') / filename
-              with path.open(encoding='utf-8', newline='') as source:
-                  reader = csv.DictReader(source)
-                  rows = list(reader)
-                  if not reader.fieldnames or 'dbid' not in reader.fieldnames:
-                      raise ValueError(f'{path}: missing dbid column')
-              if not rows:
-                  raise ValueError(f'{path}: empty ranking; refusing to publish')
-              print(f'{path}: {len(rows)} rows')
+              previous = path.read_bytes()
+              print(f'::group::Refresh {name}', flush=True)
+              try:
+                  subprocess.run(
+                      [sys.executable, '-c', f'import update_snippets; update_snippets.{function}()'],
+                      check=True, timeout=600,
+                  )
+                  with path.open(encoding='utf-8', newline='') as source:
+                      reader = csv.DictReader(source)
+                      rows = list(reader)
+                      if not reader.fieldnames or 'dbid' not in reader.fieldnames:
+                          raise ValueError('missing dbid column')
+                      if reader.fieldnames[0] not in ('rank', 'spine'):
+                          raise ValueError('missing rank or spine column')
+                  if not rows:
+                      raise ValueError('source returned an empty ranking')
+                  if any(None in row or any(value is None for value in row.values()) for row in rows):
+                      raise ValueError('source returned malformed CSV rows')
+              except (subprocess.SubprocessError, OSError, ValueError, csv.Error) as error:
+                  path.write_bytes(previous)
+                  print(f'::warning::{name}: refresh failed; previous CSV retained. See source logs.')
+                  print(f'{type(error).__name__}: {error}', flush=True)
+                  results.append(f'| {name} | Unavailable; previous data retained |')
+              else:
+                  successful += 1
+                  print(f'{path}: {len(rows)} rows', flush=True)
+                  results.append(f'| {name} | Refreshed: {len(rows)} rows |')
+              finally:
+                  print('::endgroup::', flush=True)
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write('## Ranking refresh results\n\n| Source | Result |\n| --- | --- |\n')
+              summary.write('\n'.join(results) + '\n')
+          if not successful:
+              raise SystemExit('All ranking sources failed; no data will be published.')
           PY
 
       - name: Build JSON data
@@ -125,3 +156,4 @@ jobs:
           git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m ":arrow_up: Daily update at $(date -u +%F)"
           git push origin "HEAD:refs/heads/$UPDATE_BRANCH"
+
