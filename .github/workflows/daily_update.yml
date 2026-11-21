@@ -2,6 +2,9 @@ name: Daily Update
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/daily_update.yml
   schedule:
     # Daily at 12:00 UTC (18:00 Asia/Dhaka).
     - cron: '0 12 * * *'
