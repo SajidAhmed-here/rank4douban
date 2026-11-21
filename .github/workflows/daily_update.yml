@@ -3,53 +3,125 @@ name: Daily Update
 on:
   workflow_dispatch:
   schedule:
-    - cron:  '0 12 */1 * *'
+    # Daily at 12:00 UTC (18:00 Asia/Dhaka).
+    - cron: '0 12 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-update-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: '1'
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
 
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-    - name: Install dependencies
-      run: pip install -r requirements.txt
+      - name: Install and check Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+          python -c "import bs4, lxml, requests, cloudscraper, selenium, webdriver_manager"
 
-    # 安装 Chrome 和 ChromeDriver（GitHub Actions 必备）
-    - name: Installed package list
-      run: apt list --installed
+      - name: Prepare browser for existing Selenium code
+        # The runner provides Chrome. The code asks webdriver-manager for
+        # Chromium, so expose the same browser under that name for version detection.
+        run: |
+          chrome_path="$(command -v google-chrome)"
+          sudo ln -sf "$chrome_path" /usr/local/bin/chromium
+          google-chrome --version
+          chromium --version
 
-    - name: Remove Chrome
-      run: sudo apt purge google-chrome-stable
+      - name: Verify browser and matching driver
+        run: |
+          python - <<'PY'
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from webdriver_manager.chrome import ChromeDriverManager
+          from webdriver_manager.core.os_manager import ChromeType
 
-    - name: Remove default Chromium
-      run: sudo apt purge chromium-browser
+          options = Options()
+          for argument in ('--headless=new', '--no-sandbox', '--disable-dev-shm-usage'):
+              options.add_argument(argument)
+          service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+          with webdriver.Chrome(service=service, options=options) as driver:
+              driver.get('data:text/html,<title>Browser check</title>')
+              assert driver.title == 'Browser check', 'Browser startup check failed'
+          PY
 
-    - name: Install a new Chromium
-      run: sudo apt install -y chromium-browser
+      - name: Refresh ranking CSVs
+        run: python update_snippets.py
 
-    - name: Run task
-      run: |
-        python update_snippets.py
-        python build_data.py
+      - name: Validate refreshed CSVs
+        # Some scrapers silently write an empty list when a site blocks requests.
+        # Fail before publishing such results, including the currently empty Letterboxd list.
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
 
-    - name: Commit files
-      run: |
-        DATE=`date +%Y-%m-%d`
-        git add .
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git commit -a -m ":arrow_up: Daily update at $DATE"
+          filenames = (
+              '01_IMDbtop250.csv', '03_CClist.csv', '06_Bangumitop250.csv',
+              '08_letterboxed_top_250.csv', '99_douban_top250.csv',
+          )
+          for filename in filenames:
+              path = Path('data') / filename
+              with path.open(encoding='utf-8', newline='') as source:
+                  reader = csv.DictReader(source)
+                  rows = list(reader)
+                  if not reader.fieldnames or 'dbid' not in reader.fieldnames:
+                      raise ValueError(f'{path}: missing dbid column')
+              if not rows:
+                  raise ValueError(f'{path}: empty ranking; refusing to publish')
+              print(f'{path}: {len(rows)} rows')
+          PY
 
-    - name: Push changes
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        branch: ${{ github.ref }}
+      - name: Build JSON data
+        run: python build_data.py
+
+      - name: Validate generated JSON
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in sorted(Path('snippets').glob('*.json')) + [Path('data.json')]:
+              json.loads(path.read_text(encoding='utf-8'))
+              print(f'{path}: valid JSON')
+          PY
+
+      - name: Commit and push changed data
+        env:
+          UPDATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          git add -- data/*.csv snippets/*.json data.json
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git config --local user.name 'github-actions[bot]'
+          git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m ":arrow_up: Daily update at $(date -u +%F)"
+          git push origin "HEAD:refs/heads/$UPDATE_BRANCH"
